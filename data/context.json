@@ -1,0 +1,14 @@
+{
+  "status": "Illustrative regional context; not verified agronomic recommendations. Verify against current local extension guidance before research use.",
+  "regions": {
+    "Mandya": {"zone": "Southern Karnataka", "water": "Irrigation availability varies by farm; ask the farmer."},
+    "Mysuru": {"zone": "Southern Karnataka", "water": "Rain-fed and irrigated farms; do not assume current weather."},
+    "Dharwad": {"zone": "Northern Karnataka", "water": "Local soil and rainfall vary; ask before recommending irrigation."},
+    "Raichur": {"zone": "Northeastern Karnataka", "water": "Confirm irrigation, drainage and local conditions."}
+  },
+  "reference_portals": [
+    {"title": "ICAR", "url": "https://icar.gov.in"},
+    {"title": "Karnataka Department of Agriculture", "url": "https://raitamitra.karnataka.gov.in"},
+    {"title": "University of Agricultural Sciences, Bengaluru", "url": "https://www.uasbangalore.edu.in"}
+  ]
+}
