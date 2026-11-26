@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><style>
+body { margin: 0; font: 14px system-ui, sans-serif; color: #244b35; }
+button { width: 40px; height: 40px; border: 1px solid #b8d1bd; border-radius: 50%; background: #edf5e9; color: #245c40; cursor: pointer; font-size: 19px; }
+button:hover { background: #dceedd; } button:disabled { opacity: .6; cursor: default; }
+#status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+</style></head>
+<body>
+<button id="mic" type="button"></button><p id="status" role="status"></p>
+<script>
+const button = document.getElementById('mic');
+const status = document.getElementById('status');
+const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let args = {}, recognition = null, listening = false, lastError = '';
+function send(type, data = {}) { window.parent.postMessage({isStreamlitMessage: true, type, ...data}, '*'); }
+function render() {
+  const label = listening ? args.stop_label : args.start_label;
+  button.textContent = lastError ? '⚠️' : (listening ? '⏹' : '🎙️');
+  button.setAttribute('aria-label', lastError || label);
+  button.title = lastError || label;
+  if (!Recognition) { button.disabled = true; button.title = args.unsupported; status.textContent = args.unsupported; }
+  send('streamlit:setFrameHeight', {height: 44});
+}
+window.addEventListener('message', event => {
+  if (event.data.type === 'streamlit:render') { args = event.data.args; render(); }
+});
+button.addEventListener('click', () => {
+  if (listening) { recognition.stop(); return; }
+  lastError = '';
+  const session = Date.now() + '-' + Math.random();
+  let sequence = 0, transcript = '', previousPreview = null, previewEdited = false;
+  // Streamlit serves this component in a same-origin iframe in the local app.
+  // Show interim results immediately without waiting for a server rerun.
+  function questionField() {
+    try {
+      const frame = window.frameElement;
+      const area = frame && frame.closest('.st-key-askquestion_area, .st-key-comparequestion_area');
+      return area && area.querySelector('textarea');
+    } catch (_) { return null; }
+  }
+  const initialField = questionField();
+  const initialText = initialField ? initialField.value : '';
+  function publish(text) {
+    send('streamlit:setComponentValue', {value: {text, session, sequence: ++sequence}, dataType: 'json'});
+  }
+  recognition = new Recognition();
+  recognition.lang = args.locale;
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.onstart = () => { listening = true; status.textContent = args.listening; render(); };
+  recognition.onresult = event => {
+    const text = Array.from(event.results, result => result[0].transcript.trim()).filter(Boolean).join(' ');
+    if (text) {
+      transcript = text;
+      status.textContent = text;
+      const field = questionField();
+      if (field && !previewEdited) {
+        if (previousPreview !== null && field.value !== previousPreview) previewEdited = true;
+        else {
+          previousPreview = [initialText.trimEnd(), text].filter(Boolean).join(' ').slice(0, 4000);
+          field.value = previousPreview;
+        }
+      } else if (!field) {
+        // If iframe isolation prevents a direct preview, retain the server-backed fallback.
+        publish(text);
+      }
+    }
+  };
+  recognition.onerror = event => { lastError = args.error + ' (' + event.error + ')'; status.textContent = lastError; render(); };
+  recognition.onend = () => {
+    listening = false;
+    if (transcript && !previewEdited) publish(transcript);
+    render();
+  };
+  try { recognition.start(); } catch (_) { lastError = args.error; status.textContent = lastError; render(); }
+});
+send('streamlit:componentReady', {apiVersion: 1});
+send('streamlit:setFrameHeight', {height: 44});
+</script></body></html>

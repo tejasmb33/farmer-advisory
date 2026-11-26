@@ -8,7 +8,7 @@ import random
 from pathlib import Path
 from datetime import datetime, timezone
 import pandas as pd
-from llm import run_advisory
+from llm import run_advisory, get_client, count_message_tokens
 from prompts import VERSIONS, library_hash
 
 ROOT = Path(__file__).parent
@@ -28,6 +28,7 @@ def run_batch(args):
     manifest = dict(mode=args.mode, model=args.model if args.mode=='live' else 'offline fixture',
         temperature=0.2, library_hash=library_hash(), repeats=args.repeats, versions=selected,
         price_input=args.price_in,price_output=args.price_out,price_date=os.getenv('PRICE_DATE'),
+        cache_enabled=not getattr(args,'no_cache',False),cache_write_mult=getattr(args,'cache_write_mult',1.25),cache_read_mult=getattr(args,'cache_read_mult',0.1),
         query_sha256=hashlib.sha256(Path(args.queries).read_bytes()).hexdigest())
     manifest_path = output.with_suffix('.manifest.json')
     if output.exists() and not manifest_path.exists(): raise ValueError('Existing outputs have no manifest; choose a new path')
@@ -46,10 +47,13 @@ def run_batch(args):
                 if rid in done: continue
                 try:
                     result = run_advisory(case,version,mode=args.mode,model=args.model,
-                                          price_in=args.price_in,price_out=args.price_out)
+                                          price_in=args.price_in,price_out=args.price_out,
+                                          cache=False if getattr(args,'no_cache',False) else None,
+                                          cache_write_mult=getattr(args,'cache_write_mult',1.25),
+                                          cache_read_mult=getattr(args,'cache_read_mult',0.1))
                     row = dict(result, record_id=rid,query_id=case['id'], repeat=repeat,
                                question=case['question'],category=case.get('category',''),price_date=os.getenv('PRICE_DATE',''))
-                    for field in ('calls','advice'): row[field]=json.dumps(row[field],ensure_ascii=False)
+                    for field in ('calls','advice','context_report'): row[field]=json.dumps(row[field],ensure_ascii=False)
                     frame=pd.DataFrame([row])
                     frame.to_csv(output,mode='a',header=not output.exists(),index=False,encoding='utf-8')
                     done.add(rid)
@@ -98,6 +102,13 @@ def summarize_frames(outputs, scores, mapping):
         populations=[set(zip(group.query_id,group.repeat)) for _,group in df.groupby('version')]
         if populations and any(population!=populations[0] for population in populations):
             raise ValueError('Versions must contain matched query IDs and repeats')
+    optional=[]
+    for column in ('cache_write_tokens','cache_read_tokens','cost_weighted_input_tokens'):
+        if column in df:
+            df[column]=pd.to_numeric(df[column],errors='coerce')
+            if df[column].notna().all(): optional.append(column)
+    if 'cost_weighted_input_tokens' in optional:
+        df['weighted_tokens']=df.cost_weighted_input_tokens+df.output_tokens.astype(float); optional.append('weighted_tokens')
     df['quality']=df[CRITERIA].mean(axis=1)
     df['total_tokens']=pd.to_numeric(df['total_tokens'],errors='raise')
     if df.total_tokens.isna().any() or (df.total_tokens<=0).any(): raise ValueError('Token totals must be positive')
@@ -105,7 +116,7 @@ def summarize_frames(outputs, scores, mapping):
     df['efficiency']=df.quality/df.total_tokens*1000
     df['cost_usd']=pd.to_numeric(df.cost_usd,errors='coerce')
     if (df.cost_usd.dropna()<0).any(): raise ValueError('Costs cannot be negative')
-    grouped=df.groupby(['version','language'],sort=False)[CRITERIA+['quality','input_tokens','output_tokens','total_tokens','cost_usd','seconds','efficiency']].mean().reset_index()
+    grouped=df.groupby(['version','language'],sort=False)[CRITERIA+['quality','input_tokens','output_tokens','total_tokens','cost_usd','seconds','efficiency']+optional].mean().reset_index()
     complete_costs=df.groupby(['version','language']).cost_usd.agg(lambda values: values.mean() if values.notna().all() else float('nan')).reset_index(name='complete_cost')
     grouped=grouped.merge(complete_costs,on=['version','language'])
     grouped['cost_usd']=grouped.pop('complete_cost')
@@ -121,6 +132,11 @@ def summarize_frames(outputs, scores, mapping):
     baseline=grouped[grouped.version=='V5'][['language','total_tokens']].rename(columns={'total_tokens':'v5_tokens'})
     grouped=grouped.merge(baseline,on='language',how='left')
     grouped['token_savings_pct']=(1-grouped.total_tokens/grouped.v5_tokens)*100
+    if 'weighted_tokens' in optional:
+        # Cost-weighted tokens bill cache writes/reads at their multiples, so caching shows up here, not in raw tokens.
+        weighted=grouped[grouped.version=='V5'][['language','weighted_tokens']].rename(columns={'weighted_tokens':'v5_weighted'})
+        grouped=grouped.merge(weighted,on='language',how='left')
+        grouped['weighted_savings_pct']=(1-grouped.weighted_tokens/grouped.v5_weighted)*100
     return df,grouped
 
 def summarize(args):
@@ -133,23 +149,43 @@ def summarize(args):
     chart.save(str(target/'tradeoff.html'))
     print('Saved summaries and interactive trade-off chart.')
 
-def language_gap(args):
-    import anthropic
-    if not args.model: raise ValueError('Set a valid model ID')
-    client=anthropic.Anthropic(timeout=60,max_retries=2)
-    samples=pd.read_csv(args.samples)
+def load_language_samples(path=None):
+    samples=pd.read_csv(path or ROOT/'data/language_samples.csv')
     if samples.duplicated(['id','language']).any(): raise ValueError('Duplicate language sample')
     groups=samples.groupby('id').language.agg(set)
     if any(langs != {'English','Kannada','Hindi'} for langs in groups): raise ValueError('Each sample needs all three languages')
+    return samples
+
+def gap_summary(df,column):
+    """Mean of `column` per language and its ratio to English."""
+    summary=df.groupby('language')[column].mean().to_frame('mean_'+column)
+    summary['ratio_to_english']=summary['mean_'+column]/summary.loc['English','mean_'+column]
+    return summary.reset_index()
+
+def proxy_summary(samples):
+    """Offline, no-API proxy: characters and UTF-8 bytes per language. These are NOT tokens."""
+    df=samples.copy()
+    df['characters']=df.text.str.len(); df['utf8_bytes']=df.text.map(lambda t:len(t.encode('utf-8')))
+    out=gap_summary(df,'characters').merge(gap_summary(df,'utf8_bytes'),on='language',suffixes=('_chars','_bytes'))
+    return out.rename(columns={'ratio_to_english_chars':'chars_ratio_to_english','ratio_to_english_bytes':'bytes_ratio_to_english'})
+
+def measure_language_gap(samples,counter,model):
+    """Count tokens for each aligned sample with `counter(text)`; returns (rows, summary)."""
     rows=[]
-    # Absolute message counts include provider framing; report framing explicitly.
     for row in samples.to_dict('records'):
-        counted=client.messages.count_tokens(model=args.model,messages=[{'role':'user','content':row['text']}])
-        rows.append(dict(row,input_tokens=counted.input_tokens,model=args.model,count_scope='Single user message including provider framing',timestamp=datetime.now(timezone.utc).isoformat()))
-    df=pd.DataFrame(rows);write_csv(df,args.output)
-    summary=df.groupby('language').input_tokens.mean().to_frame('mean_message_tokens')
-    summary['ratio_to_english']=summary.mean_message_tokens/summary.loc['English','mean_message_tokens']
-    write_csv(summary.reset_index(),Path(args.output).with_suffix('.summary.csv'))
+        rows.append(dict(row,input_tokens=counter(row['text']),model=model,
+                         count_scope='Single user message including provider framing',
+                         timestamp=datetime.now(timezone.utc).isoformat()))
+    df=pd.DataFrame(rows)
+    return df,gap_summary(df,'input_tokens').rename(columns={'mean_input_tokens':'mean_message_tokens'})
+
+def language_gap(args):
+    if not args.model: raise ValueError('Set a valid model ID')
+    client=get_client()
+    samples=load_language_samples(args.samples)
+    # Absolute message counts include provider framing; report framing explicitly.
+    df,summary=measure_language_gap(samples,lambda text:count_message_tokens(client,args.model,text),args.model)
+    write_csv(df,args.output);write_csv(summary,Path(args.output).with_suffix('.summary.csv'))
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest='command',required=True)
@@ -160,6 +196,9 @@ def main():
     run.add_argument('--model',default=os.getenv('ANTHROPIC_MODEL',''))
     run.add_argument('--versions',default=','.join(VERSIONS));run.add_argument('--repeats',type=int,default=1)
     run.add_argument('--price-in',type=float,default=None);run.add_argument('--price-out',type=float,default=None)
+    run.add_argument('--cache-write-mult',type=float,default=float(os.getenv('PRICE_CACHE_WRITE_MULT') or 1.25),help='Cache-write price as a multiple of the base input price')
+    run.add_argument('--cache-read-mult',type=float,default=float(os.getenv('PRICE_CACHE_READ_MULT') or 0.1),help='Cache-read price as a multiple of the base input price (differs by model; check pricing)')
+    run.add_argument('--no-cache',action='store_true',help='Send the V11 guide without a cache marker (control run)')
     blind=sub.add_parser('blind');blind.set_defaults(func=blind_export)
     blind.add_argument('--input',default=str(ROOT/'results/outputs.csv'));blind.add_argument('--directory',default=str(ROOT/'results/review'));blind.add_argument('--seed',type=int,default=42)
     report=sub.add_parser('summarize');report.set_defaults(func=summarize)

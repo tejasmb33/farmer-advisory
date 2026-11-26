@@ -1,10 +1,21 @@
+import pytest
 from pathlib import Path
 from streamlit.testing.v1 import AppTest
 
 APP=Path(__file__).resolve().parents[1]/'app.py'
 
+@pytest.fixture(autouse=True)
+def isolate_app_connections(monkeypatch):
+    import httpx
+    def offline(*args, **kwargs):
+        raise httpx.ConnectError('offline test')
+    monkeypatch.setattr(httpx, 'get', offline)
+    monkeypatch.setenv('ANTHROPIC_MODEL', '')
+
+
 def test_app_demo_and_compare():
     at=AppTest.from_file(str(APP),default_timeout=20).run()
+    at.radio[0].set_value('Offline demo').run()
     assert not at.exception
     # Exercise example loading, form submission, multilingual advice and comparison.
     at.selectbox(key='asklang').select('Kannada').run()
@@ -22,6 +33,7 @@ def test_app_demo_and_compare():
 
 def test_empty_query_and_live_settings():
     at=AppTest.from_file(str(APP),default_timeout=20).run()
+    at.radio[0].set_value('Offline demo').run()
     at.button[0].click().run()
     assert any('Describe a crop problem' in w.value for w in at.warning)
     at.radio[0].set_value('Live API').run()
@@ -33,6 +45,7 @@ def test_empty_query_and_live_settings():
 
 def test_kannada_interface_and_switch_back():
     at=AppTest.from_file(str(APP),default_timeout=20).run()
+    at.radio[0].set_value('Offline demo').run()
     at.selectbox(key='ui_language').select('Kannada').run()
     assert not at.exception
     assert at.tabs[0].label == '🌿  ಕೃಷಿ ಸಲಹೆ ಪಡೆಯಿರಿ'

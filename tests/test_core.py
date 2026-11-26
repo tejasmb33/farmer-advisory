@@ -37,14 +37,13 @@ class FakeClient:
         return SimpleNamespace(content=[SimpleNamespace(type='text',text=json.dumps(ADVICE))],
                usage=SimpleNamespace(input_tokens=100,output_tokens=40),stop_reason='max_tokens' if len(self.requests)==1 else 'end_turn')
 
-def test_v9_counts_both_calls_and_any_truncation():
+def test_v9_does_not_translate_a_truncated_response():
     client=FakeClient()
     result=run_advisory(CASE,'V9',mode='live',model='test-model',client=client,price_in=3,price_out=15)
-    assert result['total_tokens']==280 and result['input_tokens']==200 and len(result['calls'])==2
+    assert result['total_tokens']==140 and result['input_tokens']==100 and len(result['calls'])==1
     assert result['truncated'] is True and result['format_ok'] is True
-    assert result['cost_usd']==pytest.approx(.0018)
+    assert result['cost_usd']==pytest.approx(.0009)
     assert all(c['temperature']==.2 and c['model']=='test-model' for c in client.requests)
-    assert json.dumps(ADVICE) == client.requests[1]['messages'][0]['content']
 
 def test_v9_english_one_call_and_v10_cap():
     client=FakeClient();run_advisory(dict(CASE,language='English'),'V9',mode='live',model='test',client=client)
@@ -92,15 +91,19 @@ def test_summary_requires_matched_case_populations():
 @pytest.mark.parametrize('language',['English','Kannada'])
 def test_live_language_contract_across_versions(version,language):
     client=FakeClient()
+    # Exercise the translation path with a complete first response.
+    client.requests.append({'placeholder': True})
     run_advisory(dict(CASE,language=language),version,mode='live',model='test',client=client)
     request=client.requests[-1]
-    assert language in request['system']
+    system = request['system']
+    system_text = ' '.join(block['text'] for block in system) if isinstance(system, list) else system
+    assert language in system_text
     if language=='Kannada':
-        assert 'Kannada' in request['system']
+        assert 'Kannada' in system_text
     if version=='V9' and language=='Kannada':
-        assert len(client.requests)==2
+        assert len(client.requests)==3
     else:
-        assert len(client.requests)==1
+        assert len(client.requests)==2
 
 
 def test_unicode_report_translation():
@@ -108,3 +111,27 @@ def test_unicode_report_translation():
     assert translate('Crop','Kannada')=='ಬೆಳೆ'
     assert translate('Crop','English')=='Crop'
     assert localize_data({'safety':'Unsafe or overconfident'},'Kannada')=={'ಸುರಕ್ಷತೆ':'ಅಸುರಕ್ಷಿತ ಅಥವಾ ಅತಿಯಾದ ಖಚಿತತೆ'}
+
+
+def test_ollama_mode_accounting(monkeypatch):
+    import httpx
+    captured = []
+    def fake_post(url, json=None, timeout=None):
+        captured.append((url, json))
+        return SimpleNamespace(
+            raise_for_status=lambda: None,
+            json=lambda: {
+                'message': {'content': '{"problem":"Leaf spot","cause":"Fungal","steps":["Remove leaves"],"prevent":"Spacing","expert":"Ask KVK","follow_up":"Any spots?"}'},
+                'prompt_eval_count': 42,
+                'eval_count': 18,
+                'done_reason': 'stop',
+            },
+        )
+    monkeypatch.setattr(httpx, 'post', fake_post)
+    result = run_advisory(dict(CASE, language='English'), 'V10', mode='ollama', model='llama3.2', ollama_url='http://localhost:11434')
+    assert result['mode'] == 'ollama'
+    assert result['cost_usd'] == 0.0
+    assert result['input_tokens'] == 42 and result['output_tokens'] == 18 and result['total_tokens'] == 60
+    assert result['format_ok'] is True
+    assert captured[0][0] == 'http://localhost:11434/api/chat'
+    assert captured[0][1]['options']['num_predict'] == 700
